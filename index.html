@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101826">
+  <meta name="description" content="Einfache mobile Depot-Seite fuer die bestehende Depot-Automatisierung.">
+  <title>Stefa Depot Startseite</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./assets/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <div class="ambient ambient-a"></div>
+    <div class="ambient ambient-b"></div>
+
+    <header class="hero">
+      <div class="hero-topline">
+        <div>
+          <p class="eyebrow">Mobile Depot-Seite</p>
+          <h1>Stefa Depot Startseite</h1>
+        </div>
+        <span class="badge badge-accent">Auf dem Handy speicherbar</span>
+      </div>
+
+      <div class="hero-grid">
+        <section class="hero-card hero-balance reveal">
+          <p class="card-label">Gesamtwert</p>
+          <h2 id="totalValue">-</h2>
+          <p id="balanceSubline" class="muted">Snapshot wird geladen</p>
+          <div class="health-row">
+            <div class="health-ring" aria-hidden="true">
+              <span id="healthScore">-</span>
+            </div>
+            <div>
+              <p class="card-label">Portfolio-Fitness</p>
+              <p id="healthSummary" class="muted">Regelwerk wird geprueft</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="hero-card reveal">
+          <p class="card-label">Heute wichtig</p>
+          <ul class="signal-list" id="heroSignals"></ul>
+        </section>
+      </div>
+    </header>
+
+    <nav class="tab-bar" aria-label="Bereiche">
+      <button class="tab-button is-active" data-tab="overview">Fokus</button>
+      <button class="tab-button" data-tab="positions">Positionen</button>
+      <button class="tab-button" data-tab="rules">Regeln</button>
+      <button class="tab-button" data-tab="assistant">Wochenbrief</button>
+    </nav>
+
+    <main>
+      <section class="tab-panel is-active" id="tab-overview">
+        <div class="card-grid">
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Kontrolle</p>
+                <h3>Leitplanken</h3>
+              </div>
+              <span class="badge" id="snapshotDateChip">-</span>
+            </div>
+            <div class="stat-grid" id="kpiGrid"></div>
+          </article>
+
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Handlungsdruck</p>
+                <h3>Warnungen und Chancen</h3>
+              </div>
+            </div>
+            <div id="alertsList" class="stack"></div>
+          </article>
+
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Konzentration</p>
+                <h3>Top Cluster</h3>
+              </div>
+            </div>
+            <div id="clusterBars" class="stack"></div>
+          </article>
+
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Naechste Schritte</p>
+                <h3>Wo dir die Seite hilft</h3>
+              </div>
+            </div>
+            <div id="helperModes" class="feature-grid"></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="tab-panel" id="tab-positions">
+        <div class="panel-card panel-card-wide reveal">
+          <div class="section-head section-head-wrap">
+            <div>
+              <p class="eyebrow">Bestand</p>
+              <h3>Positionen im Blick</h3>
+            </div>
+            <div class="controls">
+              <input type="search" id="positionSearch" placeholder="Name, Symbol oder Thema">
+              <div class="filter-row" id="bucketFilters"></div>
+            </div>
+          </div>
+          <div id="positionsList" class="stack"></div>
+        </div>
+      </section>
+
+      <section class="tab-panel" id="tab-rules">
+        <div class="card-grid">
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Deckel</p>
+                <h3>Harte Limits</h3>
+              </div>
+            </div>
+            <div id="hardLimits" class="stack compact-stack"></div>
+          </article>
+
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Zielkorridore</p>
+                <h3>Liquiditaet und Buckets</h3>
+              </div>
+            </div>
+            <div id="corridorList" class="stack compact-stack"></div>
+          </article>
+
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Regellogik</p>
+                <h3>Warum die Seite klarer ist</h3>
+              </div>
+            </div>
+            <div id="logicReasons" class="stack"></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="tab-panel" id="tab-assistant">
+        <div class="card-grid">
+          <article class="panel-card assistant-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Wochenbrief</p>
+                <h3>Kurze Einordnung fuer diese Woche</h3>
+              </div>
+              <span class="badge badge-accent">Optional mit KI ausbaubar</span>
+            </div>
+            <div id="assistantBriefing" class="assistant-copy"></div>
+          </article>
+
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Roadmap</p>
+                <h3>Was als Naechstes moeglich ist</h3>
+              </div>
+            </div>
+            <div id="futureStack" class="stack"></div>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="./data/latest-snapshot.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

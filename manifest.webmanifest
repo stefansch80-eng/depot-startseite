@@ -1,0 +1,17 @@
+{
+  "name": "Stefa Depot Startseite",
+  "short_name": "Depot Start",
+  "description": "Einfache mobile Depot-Seite fuer die bestehende Depot-Automatisierung.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#07111d",
+  "theme_color": "#101826",
+  "icons": [
+    {
+      "src": "./assets/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
