@@ -1,0 +1,1839 @@
+(() => {
+  const snapshot = window.DEPOT_APP_SNAPSHOT;
+
+  if (!snapshot || !snapshot.portfolio || !snapshot.rules || !snapshot.meta) {
+    document.body.innerHTML = "<main style='padding:24px;color:#fff;font-family:sans-serif'>Fehlende Daten. Bitte zuerst ./generate-app-data.ps1 ausfuehren.</main>";
+    return;
+  }
+
+  const portfolio = snapshot.portfolio;
+  const rules = snapshot.rules;
+  const meta = snapshot.meta;
+  const positions = (portfolio.positions || []).map((position) => ({
+    ...position,
+    bucket: position.strategy_bucket || position.bucket || "Swing",
+    theme_tags: Array.isArray(position.theme_tags) ? position.theme_tags : [],
+  }));
+
+  const state = {
+    tab: "overview",
+    filter: "Alle",
+    query: "",
+  };
+
+  const totalValue = Number(portfolio.cash?.amount || 0) + positions.reduce((sum, item) => sum + Number(item.market_value || 0), 0);
+  const cashAmount = Number(portfolio.cash?.amount || 0);
+  const cashQuote = percent(cashAmount, totalValue);
+  const analysis = buildAnalysis();
+
+  renderChrome();
+  renderOverview();
+  renderPositions();
+  renderRules();
+  renderAssistant();
+  bindEvents();
+  maybeRegisterServiceWorker();
+
+  function buildAnalysis() {
+    const reserveValue = positions
+      .filter((item) => item.bucket === "Reserve")
+      .reduce((sum, item) => sum + Number(item.market_value || 0), 0);
+
+    const combinedLiquidityQuote = percent(cashAmount + reserveValue, totalValue);
+    const clusterWeights = aggregateBy("risk_cluster");
+    const tagWeights = aggregateTags();
+
+    const computedPositions = positions
+      .map((position) => {
+        const weightPct = percent(position.market_value, totalValue);
+        const breaches = getBreaches(position, weightPct);
+        const applicableLimit = getTightestLimit(position);
+        const targetWeight = applicableLimit ? applicableLimit.limit : null;
+        const sellAmount = targetWeight !== null && weightPct > targetWeight
+          ? roundMoney(Number(position.market_value) - ((targetWeight / 100) * totalValue))
+          : 0;
+
+        return {
+          ...position,
+          weightPct,
+          breaches,
+          tone: breaches.length ? "danger" : weightPct >= 5.5 ? "warn" : "good",
+          action: breaches.length ? "TEILVERKAUF" : weightPct < 2 ? "BEOBACHTEN" : "HALTEN",
+          targetWeight,
+          sellAmount,
+        };
+      })
+      .sort((left, right) => right.weightPct - left.weightPct);
+
+    const themeLimit = Number(rules.portfolio_rules?.max_theme_cluster_percent || 0);
+    const clusterAlerts = clusterWeights
+      .filter((item) => item.weightPct >= themeLimit * 0.75)
+      .sort((left, right) => right.weightPct - left.weightPct);
+
+    const hardBreaches = computedPositions.filter((item) => item.breaches.length);
+    const healthScore = computeHealthScore(hardBreaches.length, combinedLiquidityQuote, cashQuote, clusterWeights);
+
+    return {
+      totalValue,
+      cashAmount,
+      cashQuote,
+      reserveValue,
+      combinedLiquidityQuote,
+      clusterWeights,
+      tagWeights,
+      positions: computedPositions,
+      hardBreaches,
+      clusterAlerts,
+      healthScore,
+    };
+  }
+
+  function aggregateBy(key) {
+    const buckets = new Map();
+
+    positions.forEach((position) => {
+      const bucketKey = position[key] || "Nicht klassifiziert";
+      const current = buckets.get(bucketKey) || {
+        name: bucketKey,
+        value: 0,
+        labels: [],
+      };
+
+      current.value += Number(position.market_value || 0);
+      current.labels.push(`${position.name} (${position.symbol})`);
+      buckets.set(bucketKey, current);
+    });
+
+    return [...buckets.values()]
+      .map((item) => ({
+        ...item,
+        weightPct: percent(item.value, totalValue),
+      }))
+      .sort((left, right) => right.weightPct - left.weightPct);
+  }
+
+  function aggregateTags() {
+    const buckets = new Map();
+
+    positions.forEach((position) => {
+      position.theme_tags.forEach((tag) => {
+        const current = buckets.get(tag) || {
+          name: tag,
+          value: 0,
+          labels: [],
+        };
+        current.value += Number(position.market_value || 0);
+        current.labels.push(`${position.name} (${position.symbol})`);
+        buckets.set(tag, current);
+      });
+    });
+
+    return [...buckets.values()]
+      .map((item) => ({
+        ...item,
+        weightPct: percent(item.value, totalValue),
+      }))
+      .sort((left, right) => right.weightPct - left.weightPct);
+  }
+
+  function getBreaches(position, weightPct) {
+    const issues = [];
+    const portfolioRules = rules.portfolio_rules || {};
+    const swingRules = rules.swing_rules || {};
+
+    if (isBroadMarketEtf(position) && weightPct > Number(portfolioRules.max_broad_market_etf_percent || 0)) {
+      issues.push(`Broad ETF ueber ${portfolioRules.max_broad_market_etf_percent}%`);
+    }
+
+    if (position.bucket === "Reserve" && weightPct > Number(portfolioRules.max_reserve_position_percent || 0)) {
+      issues.push(`Reserve ueber ${portfolioRules.max_reserve_position_percent}%`);
+    }
+
+    if (isThematicEtf(position) && weightPct > Number(portfolioRules.max_thematic_etf_percent || 0)) {
+      issues.push(`Thematischer ETF ueber ${portfolioRules.max_thematic_etf_percent}%`);
+    }
+
+    if (isStock(position) && weightPct > Number(portfolioRules.max_single_stock_percent || 0)) {
+      issues.push(`Einzelaktie ueber ${portfolioRules.max_single_stock_percent}%`);
+    }
+
+    if (isHighRiskStock(position) && weightPct > Number(portfolioRules.max_high_risk_stock_percent || 0)) {
+      issues.push(`High-Risk-Aktie ueber ${portfolioRules.max_high_risk_stock_percent}%`);
+    }
+
+    if (position.bucket === "Swing" && weightPct > Number(swingRules.max_position_percent || 0)) {
+      issues.push(`Swing ueber ${swingRules.max_position_percent}%`);
+    }
+
+    return issues;
+  }
+
+  function getTightestLimit(position) {
+    const portfolioRules = rules.portfolio_rules || {};
+    const swingRules = rules.swing_rules || {};
+    const candidates = [];
+
+    if (isBroadMarketEtf(position)) {
+      candidates.push({ label: "Broad ETF", limit: Number(portfolioRules.max_broad_market_etf_percent || 0) });
+    }
+    if (position.bucket === "Reserve") {
+      candidates.push({ label: "Reserve", limit: Number(portfolioRules.max_reserve_position_percent || 0) });
+    }
+    if (isThematicEtf(position)) {
+      candidates.push({ label: "Thematischer ETF", limit: Number(portfolioRules.max_thematic_etf_percent || 0) });
+    }
+    if (isStock(position)) {
+      candidates.push({ label: "Einzelaktie", limit: Number(portfolioRules.max_single_stock_percent || 0) });
+    }
+    if (isHighRiskStock(position)) {
+      candidates.push({ label: "High Risk", limit: Number(portfolioRules.max_high_risk_stock_percent || 0) });
+    }
+    if (position.bucket === "Swing") {
+      candidates.push({ label: "Swing", limit: Number(swingRules.max_position_percent || 0) });
+    }
+
+    const realCandidates = candidates.filter((item) => item.limit > 0);
+    if (!realCandidates.length) {
+      return null;
+    }
+
+    return realCandidates.sort((left, right) => left.limit - right.limit)[0];
+  }
+
+  function computeHealthScore(breachCount, liquidityQuote, currentCashQuote, clusterWeights) {
+    let score = 100;
+    score -= breachCount * 11;
+
+    const minCash = Number(rules.portfolio_rules?.min_cash_quote_percent || 0);
+    const targetLiquidity = parseRange(rules.portfolio_rules?.target_liquidity_buffer_percent);
+    const themeClusterLimit = Number(rules.portfolio_rules?.max_theme_cluster_percent || 999);
+    const topCluster = clusterWeights[0];
+
+    if (currentCashQuote < minCash) {
+      score -= 12;
+    }
+
+    if (liquidityQuote < targetLiquidity.min || liquidityQuote > targetLiquidity.max + 4) {
+      score -= 7;
+    }
+
+    if (topCluster && topCluster.weightPct > themeClusterLimit) {
+      score -= 8;
+    }
+
+    return Math.max(36, Math.min(98, Math.round(score)));
+  }
+
+  function renderChrome() {
+    setText("totalValue", formatEuro(analysis.totalValue));
+    setText("balanceSubline", `Cash ${formatEuro(analysis.cashAmount)} | ${formatPercent(analysis.cashQuote)} Cashquote | ${formatDate(portfolio.analysis_date)}`);
+    setText("snapshotDateChip", `Snapshot ${formatDate(portfolio.analysis_date)}`);
+    setText("healthScore", analysis.healthScore);
+    setText("healthSummary", healthSummaryText());
+
+    const ring = document.querySelector(".health-ring");
+    const degrees = Math.round((analysis.healthScore / 100) * 360);
+    ring.style.background = `radial-gradient(circle at center, rgba(7, 17, 29, 0.95) 52%, transparent 53%), conic-gradient(#7ef0cf ${degrees}deg, rgba(255,255,255,0.14) ${degrees}deg)`;
+
+    const heroSignals = document.getElementById("heroSignals");
+    heroSignals.innerHTML = [
+      renderSignalItem(
+        analysis.hardBreaches.length ? `${analysis.hardBreaches.length} harte Regelverstosse` : "Keine harten Regelverstosse",
+        analysis.hardBreaches.length ? "Strikter Blick auf uebergrosse Swing- oder Themenpositionen." : "Leitplanken aktuell unter Kontrolle."
+      ),
+      renderSignalItem(
+        `${formatPercent(analysis.combinedLiquidityQuote)} Liquiditaetspuffer`,
+        corridorStatusText(analysis.combinedLiquidityQuote, rules.portfolio_rules?.target_liquidity_buffer_percent)
+      ),
+      renderSignalItem(
+        `${analysis.clusterWeights[0]?.name || "Cluster"} bei ${formatPercent(analysis.clusterWeights[0]?.weightPct || 0)}`,
+        "Die Seite zeigt dir Ballungen sofort als Fokusliste statt als verstreute Analysebausteine."
+      ),
+    ].join("");
+  }
+
+  function renderOverview() {
+    const kpiGrid = document.getElementById("kpiGrid");
+    const topWinner = [...analysis.positions].sort((a, b) => Number(b.profit_loss_percent) - Number(a.profit_loss_percent))[0];
+    const topLoser = [...analysis.positions].sort((a, b) => Number(a.profit_loss_percent) - Number(b.profit_loss_percent))[0];
+
+    kpiGrid.innerHTML = [
+      renderMiniCard("Cashquote", formatPercent(analysis.cashQuote), toneForCorridor(analysis.cashQuote, `${rules.portfolio_rules?.target_cash_quote_percent}`)),
+      renderMiniCard("Liquiditaet", formatPercent(analysis.combinedLiquidityQuote), toneForCorridor(analysis.combinedLiquidityQuote, `${rules.portfolio_rules?.target_liquidity_buffer_percent}`)),
+      renderMiniCard("Top Gewinner", `${topWinner.symbol} ${signedPercent(topWinner.profit_loss_percent)}`, Number(topWinner.profit_loss_percent) >= 0 ? "good" : "danger"),
+      renderMiniCard("Top Verlierer", `${topLoser.symbol} ${signedPercent(topLoser.profit_loss_percent)}`, Number(topLoser.profit_loss_percent) >= 0 ? "good" : "danger"),
+    ].join("");
+
+    const alerts = [
+      ...analysis.hardBreaches.slice(0, 5).map((position) => ({
+        title: `${position.symbol} auf ${formatPercent(position.weightPct)}`,
+        detail: `${position.breaches[0]}. Grobe Entlastung: ${formatEuro(position.sellAmount)} bis Ziel ${formatPercent(position.targetWeight || 0)}.`,
+        tone: "danger",
+        action: position.action,
+      })),
+      ...analysis.clusterAlerts.slice(0, 2).map((cluster) => ({
+        title: `${cluster.name} im Fokus`,
+        detail: `${formatPercent(cluster.weightPct)} Clustergewicht. Noch nicht zwingend ueber Limit, aber nahe an der Komfortgrenze.`,
+        tone: cluster.weightPct > Number(rules.portfolio_rules?.max_theme_cluster_percent || 0) ? "danger" : "warn",
+        action: "BEOBACHTEN",
+      })),
+    ];
+
+    document.getElementById("alertsList").innerHTML = alerts.length
+      ? alerts.map(renderAlertCard).join("")
+      : renderAlertCard({
+          title: "Keine akuten Warnungen",
+          detail: "Damit wuerde die Seite heute eher beruhigen als nervoes machen.",
+          tone: "good",
+          action: "HALTEN",
+        });
+
+    document.getElementById("clusterBars").innerHTML = analysis.clusterWeights
+      .slice(0, 5)
+      .map((cluster) => renderBarCard(cluster.name, cluster.weightPct, Number(rules.portfolio_rules?.max_theme_cluster_percent || 22)))
+      .join("");
+
+    const helperModes = [
+      {
+        title: "Push statt Prompt-Kette",
+        copy: "Du siehst auf einen Blick, wenn ein Limit kippt, Cash zu knapp wird oder ein Snapshot auffaellig wirkt.",
+      },
+      {
+        title: "Ein Blick statt 4 Dateien",
+        copy: "CSV, Regeln, Risikocluster und Handlungsempfehlung laufen in einer einzigen mobilen Seite zusammen.",
+      },
+      {
+        title: "Sofort klarer Wochenplan",
+        copy: "Heute handeln, diese Woche beobachten, bewusst nichts tun: genau diese drei Ebenen werden fuer dich sichtbar.",
+      },
+      {
+        title: "Auf dem Handy speichern",
+        copy: "Im Browser oeffnen, zum Startbildschirm hinzufuegen, fertig. Mehr muss fuer deinen Alltag nicht passieren.",
+      },
+    ];
+
+    document.getElementById("helperModes").innerHTML = helperModes.map(renderFeatureCard).join("");
+  }
+
+  function renderPositions() {
+    const filters = ["Alle", "Verstoesse", "Core", "Swing", "Reserve"];
+    const bucketFilters = document.getElementById("bucketFilters");
+    bucketFilters.innerHTML = filters
+      .map((filter) => `<button class="chip-button ${state.filter === filter ? "is-active" : ""}" data-filter="${filter}">${filter}</button>`)
+      .join("");
+
+    const query = state.query.trim().toLowerCase();
+    const filtered = analysis.positions.filter((position) => {
+      const matchesFilter =
+        state.filter === "Alle"
+        || (state.filter === "Verstoesse" && position.breaches.length > 0)
+        || position.bucket === state.filter;
+
+      const haystack = [
+        position.name,
+        position.symbol,
+        position.risk_cluster,
+        ...(position.theme_tags || []),
+      ].join(" ").toLowerCase();
+
+      return matchesFilter && (!query || haystack.includes(query));
+    });
+
+    document.getElementById("positionsList").innerHTML = filtered
+      .map(renderPositionCard)
+      .join("");
+  }
+
+  function renderRules() {
+    const hardLimitEntries = [
+      ["Broad-Market-ETF", `${rules.portfolio_rules?.max_broad_market_etf_percent}%`],
+      ["Thematischer ETF", `${rules.portfolio_rules?.max_thematic_etf_percent}%`],
+      ["Einzelaktie", `${rules.portfolio_rules?.max_single_stock_percent}%`],
+      ["High-Risk-Aktie", `${rules.portfolio_rules?.max_high_risk_stock_percent}%`],
+      ["Swing Maximum", `${rules.swing_rules?.max_position_percent}%`],
+      ["Themen-Cluster", `${rules.portfolio_rules?.max_theme_cluster_percent}%`],
+    ];
+
+    document.getElementById("hardLimits").innerHTML = hardLimitEntries
+      .map(([label, value]) => renderMiniRuleCard(label, value))
+      .join("");
+
+    const corridorEntries = [
+      ["Cashziel", `${rules.portfolio_rules?.target_cash_quote_percent}%`],
+      ["Mindest-Cash", `${rules.portfolio_rules?.min_cash_quote_percent}%`],
+      ["Liquiditaetspuffer", `${rules.portfolio_rules?.target_liquidity_buffer_percent}%`],
+      ["Core breit", `${rules.core_rules?.broad_core_target_range_percent}%`],
+      ["Reserve", `${rules.reserve_rules?.target_range_percent}%`],
+      ["Swing", `${rules.swing_rules?.target_range_percent}%`],
+    ];
+
+    document.getElementById("corridorList").innerHTML = corridorEntries
+      .map(([label, value]) => renderMiniRuleCard(label, value))
+      .join("");
+
+    const reasons = [
+      {
+        title: "Automation bleibt das Rueckgrat",
+        text: "Die Seite ersetzt deine bestehende Logik nicht. Sie nimmt dir nur die Reibung bei Sichtbarkeit, Einordnung und mobilen Entscheidungen ab.",
+      },
+      {
+        title: "Regeln werden visuell statt textlastig",
+        text: "Gerade bei Swing-Maxima, Cashquote und Clusterballungen ist eine visuelle Ampel deutlich staerker als ein langer Bericht.",
+      },
+      {
+        title: "Kein App-Store noetig",
+        text: "Du brauchst weder iPhone-App noch Play-Store-App. Ein sauberer mobiler Web-Aufruf reicht fuer deinen Alltag vollkommen aus.",
+      },
+    ];
+
+    document.getElementById("logicReasons").innerHTML = reasons
+      .map((item) => `<article class="reason-card"><strong>${item.title}</strong><p class="muted">${item.text}</p></article>`)
+      .join("");
+  }
+
+  function renderAssistant() {
+    const focusPositions = analysis.hardBreaches.slice(0, 3);
+    const assistantBlocks = [
+      {
+        title: "Diese Woche priorisieren",
+        items: focusPositions.length
+          ? focusPositions.map((position) => `${position.symbol}: ${position.breaches.join(", ")}. Entlastung grob ${formatEuro(position.sellAmount)}.`)
+          : ["Keine Pflichtaktion. Schwerpunkt liegt auf Beobachtung und Disziplin."],
+      },
+      {
+        title: "Bewusst nicht tun",
+        items: [
+          "Nicht wegen einzelner roter P/L-Zahlen hektisch umschichten, wenn keine Regel verletzt ist.",
+          "Keinen Nachkauf aus dem Bauch heraus, falls Cash unter die Mindestquote ruecken wuerde.",
+          "Themenballungen nicht uebersehen, nur weil die Einzeltitel einzeln noch akzeptabel wirken.",
+        ],
+      },
+      {
+        title: "Warum diese einfache Loesung stark ist",
+        items: [
+          "Aus Regeln und Snapshots entsteht ein knapper, verstaendlicher Wochenbrief statt Dateichaos.",
+          "Wenn du spaeter mehr willst, kann dieselbe Seite immer noch mit KI, Verlauf oder Sprache erweitert werden.",
+        ],
+      },
+    ];
+
+    document.getElementById("assistantBriefing").innerHTML = assistantBlocks
+      .map((block) => `
+        <section class="assistant-block">
+          <strong>${block.title}</strong>
+          <ul>${block.items.map((item) => `<li>${item}</li>`).join("")}</ul>
+        </section>
+      `)
+      .join("");
+
+    const roadmap = [
+      {
+        title: "Phase 1: Einfache Handy-Seite",
+        text: "Mobile Startseite, Snapshot aktualisieren, auf dem Handy speichern und direkt oeffnen.",
+      },
+      {
+        title: "Phase 2: Verlauf",
+        text: "Spaeter kann ein Vergleich zum letzten Snapshot dazu kommen, ohne dass die Seite komplizierter wird.",
+      },
+      {
+        title: "Phase 3: Optional KI-Briefing",
+        text: "Nur wenn du willst: kurze KI-Zusammenfassungen und Erklaerungen zu Veraenderungen.",
+      },
+      {
+        title: "Phase 4: Optional Sprache",
+        text: "Erst ganz spaet sinnvoll: Audio-Briefings oder Sprachfragen fuer unterwegs.",
+      },
+    ];
+
+    document.getElementById("futureStack").innerHTML = roadmap
+      .map((item) => `<article class="future-card"><strong>${item.title}</strong><p class="muted">${item.text}</p></article>`)
+      .join("");
+  }
+
+  function bindEvents() {
+    document.querySelectorAll(".tab-button").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.tab = button.dataset.tab;
+        document.querySelectorAll(".tab-button").forEach((item) => item.classList.toggle("is-active", item === button));
+        document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.toggle("is-active", panel.id === `tab-${state.tab}`));
+      });
+    });
+
+    document.getElementById("positionSearch").addEventListener("input", (event) => {
+      state.query = event.target.value;
+      renderPositions();
+    });
+
+    document.getElementById("bucketFilters").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-filter]");
+      if (!button) {
+        return;
+      }
+
+      state.filter = button.dataset.filter;
+      renderPositions();
+    });
+
+  }
+
+  function maybeRegisterServiceWorker() {
+    if ("serviceWorker" in navigator && window.location.protocol.startsWith("http")) {
+      navigator.serviceWorker.register("./sw.js").catch(() => {});
+    }
+  }
+
+  function healthSummaryText() {
+    if (analysis.healthScore >= 85) {
+      return "Stabil. Die Seite dient vor allem als Fruehwarnsystem.";
+    }
+    if (analysis.healthScore >= 70) {
+      return "Solide, aber mit ein paar Positionen ueber Komfortbereich.";
+    }
+    return "Mehrere Positionen brauchen aktive Entlastung oder engere Beobachtung.";
+  }
+
+  function corridorStatusText(value, rawRange) {
+    const range = parseRange(rawRange);
+    if (value < range.min) {
+      return `Unter Zielkorridor ${range.min}-${range.max}%.`;
+    }
+    if (value > range.max) {
+      return `Ueber Zielkorridor ${range.min}-${range.max}%.`;
+    }
+    return `Innerhalb Zielkorridor ${range.min}-${range.max}%.`;
+  }
+
+  function toneForCorridor(value, rawRange) {
+    const range = parseRange(rawRange);
+    if (value < range.min || value > range.max) {
+      return "warn";
+    }
+    return "good";
+  }
+
+  function parseRange(rawRange) {
+    const text = `${rawRange || ""}`;
+    const numbers = text.split("-").map((part) => Number(part.trim())).filter((part) => !Number.isNaN(part));
+    if (numbers.length === 2) {
+      return { min: numbers[0], max: numbers[1] };
+    }
+
+    const single = Number(text);
+    if (!Number.isNaN(single)) {
+      return { min: single, max: single };
+    }
+
+    return { min: 0, max: 0 };
+  }
+
+  function renderSignalItem(title, detail) {
+    return `<li class="signal-item"><strong>${title}</strong><p class="muted">${detail}</p></li>`;
+  }
+
+  function renderMiniCard(label, value, tone) {
+    return `
+      <article class="mini-card">
+        <p class="card-label">${label}</p>
+        <div class="value tone-${tone}">${value}</div>
+      </article>
+    `;
+  }
+
+  function renderAlertCard(item) {
+    return `
+      <article class="alert-card">
+        <div class="alert-topline">
+          <strong>${item.title}</strong>
+          <span class="pill pill-${item.tone}">${item.action}</span>
+        </div>
+        <p class="muted">${item.detail}</p>
+      </article>
+    `;
+  }
+
+  function renderBarCard(label, value, limit) {
+    const ratio = Math.min((value / Math.max(limit, 1)) * 100, 100);
+    const tone = value > limit ? "danger" : value > limit * 0.8 ? "warn" : "good";
+
+    return `
+      <article class="mini-card">
+        <div class="bar-row">
+          <strong>${label}</strong>
+          <span class="pill pill-${tone}">${formatPercent(value)}</span>
+        </div>
+        <div class="bar ${tone}">
+          <span style="width:${ratio}%"></span>
+        </div>
+      </article>
+    `;
+  }
+
+  function renderFeatureCard(item) {
+    return `<article class="feature-card"><strong>${item.title}</strong><p class="muted">${item.copy}</p></article>`;
+  }
+
+  function renderMiniRuleCard(label, value) {
+    return `<article class="mini-card"><strong>${label}</strong><p class="muted">${value}</p></article>`;
+  }
+
+  function renderPositionCard(position) {
+    const tone = position.breaches.length ? "danger" : Number(position.profit_loss_percent) < 0 ? "warn" : "good";
+    const barRatio = Math.min(position.weightPct / 18 * 100, 100);
+    const chips = [
+      position.bucket,
+      position.asset_type,
+      position.risk_cluster || "ohne Cluster",
+    ];
+
+    return `
+      <article class="position-card">
+        <div class="position-head">
+          <div>
+            <strong>${position.name}</strong>
+            <p class="muted">${position.symbol}</p>
+          </div>
+          <span class="pill pill-${tone}">${position.action}</span>
+        </div>
+
+        <div class="position-meta">
+          ${chips.map((chip) => `<span class="meta-chip">${chip}</span>`).join("")}
+        </div>
+
+        <div class="bar ${tone}">
+          <span style="width:${barRatio}%"></span>
+        </div>
+
+        <div class="stat-grid">
+          ${renderMiniCard("Gewicht", formatPercent(position.weightPct), tone)}
+          ${renderMiniCard("P/L", `${signedPercent(position.profit_loss_percent)} | ${signedEuro(position.profit_loss_amount)}`, Number(position.profit_loss_percent) >= 0 ? "good" : "warn")}
+          ${renderMiniCard("Marktwert", formatEuro(position.market_value), "good")}
+          ${renderMiniCard("Zielgewicht", position.targetWeight !== null ? formatPercent(position.targetWeight) : "n/a", position.breaches.length ? "danger" : "good")}
+        </div>
+
+        <div class="position-tags">
+          ${(position.theme_tags || []).map((tag) => `<span class="meta-chip">${tag}</span>`).join("")}
+        </div>
+
+        <p class="muted">
+          ${position.breaches.length
+            ? `${position.breaches.join(" | ")}. Grobe Entlastung: ${formatEuro(position.sellAmount)}.`
+            : "Keine harte Regelverletzung. Eher Beobachtung als Aktion."}
+        </p>
+      </article>
+    `;
+  }
+
+  function isEtf(position) {
+    return `${position.asset_type || ""}`.toUpperCase() === "ETF";
+  }
+
+  function isStock(position) {
+    return !isEtf(position);
+  }
+
+  function isBroadMarketEtf(position) {
+    const tags = new Set(position.theme_tags || []);
+    return isEtf(position) && (position.bucket === "Core" || tags.has("Broad Market"));
+  }
+
+  function isThematicEtf(position) {
+    return isEtf(position) && position.bucket !== "Reserve" && !isBroadMarketEtf(position);
+  }
+
+  function isHighRiskStock(position) {
+    if (!isStock(position)) {
+      return false;
+    }
+
+    const tags = new Set(position.theme_tags || []);
+    const riskyTags = ["AI", "China", "EV", "Cloud", "Semiconductors"];
+    return riskyTags.some((tag) => tags.has(tag)) || ["AI", "China EV", "China Tech"].includes(position.risk_cluster);
+  }
+
+  function percent(value, total) {
+    if (!total) {
+      return 0;
+    }
+
+    return (Number(value || 0) / Number(total)) * 100;
+  }
+
+  function roundMoney(value) {
+    return Math.max(0, Math.round(Number(value || 0)));
+  }
+
+  function formatEuro(value) {
+    return new Intl.NumberFormat("de-DE", {
+      style: "currency",
+      currency: "EUR",
+      maximumFractionDigits: 0,
+    }).format(Number(value || 0));
+  }
+
+  function signedEuro(value) {
+    const number = Number(value || 0);
+    return `${number > 0 ? "+" : ""}${new Intl.NumberFormat("de-DE", {
+      style: "currency",
+      currency: "EUR",
+      maximumFractionDigits: 0,
+    }).format(number)}`;
+  }
+
+  function formatPercent(value) {
+    return `${Number(value || 0).toLocaleString("de-DE", {
+      minimumFractionDigits: 1,
+      maximumFractionDigits: 1,
+    })}%`;
+  }
+
+  function signedPercent(value) {
+    const number = Number(value || 0);
+    const formatted = number.toLocaleString("de-DE", {
+      minimumFractionDigits: 1,
+      maximumFractionDigits: 1,
+    });
+    return `${number > 0 ? "+" : ""}${formatted}%`;
+  }
+
+  function formatDate(value) {
+    if (!value) {
+      return "ohne Datum";
+    }
+
+    const date = new Date(value);
+    if (Number.isNaN(date.valueOf())) {
+      return value;
+    }
+
+    return new Intl.DateTimeFormat("de-DE", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    }).format(date);
+  }
+
+  function setText(id, value) {
+    const element = document.getElementById(id);
+    if (element) {
+      element.textContent = value;
+    }
+  }
+})();
+
+[CmdletBinding()]
+param(
+    [string]$PortfolioFile = "..\depot-analyse\portfolio.json",
+    [string]$MetaFile = "..\depot-analyse\depot-meta.json",
+    [string]$RulesFile = "..\depot-analyse\position-sizing-rules.json",
+    [string]$OutputFile = ".\data\latest-snapshot.js"
+)
+
+function Resolve-PathSafe {
+    param([string]$PathValue)
+
+    if ([System.IO.Path]::IsPathRooted($PathValue)) {
+        return $PathValue
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot $PathValue))
+}
+
+function Write-Utf8NoBom {
+    param(
+        [string]$Path,
+        [string]$Content
+    )
+
+    $directory = Split-Path -Parent $Path
+    if ($directory) {
+        New-Item -ItemType Directory -Force -Path $directory | Out-Null
+    }
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+}
+
+$portfolioPath = Resolve-PathSafe $PortfolioFile
+$metaPath = Resolve-PathSafe $MetaFile
+$rulesPath = Resolve-PathSafe $RulesFile
+$outputPath = Resolve-PathSafe $OutputFile
+
+$portfolio = Get-Content -Raw -Path $portfolioPath | ConvertFrom-Json
+$meta = Get-Content -Raw -Path $metaPath | ConvertFrom-Json
+$rules = Get-Content -Raw -Path $rulesPath | ConvertFrom-Json
+
+$payload = [ordered]@{
+    generated_at = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssK")
+    portfolio = $portfolio
+    meta = $meta
+    rules = $rules
+}
+
+$json = $payload | ConvertTo-Json -Depth 20
+$content = @(
+    "window.DEPOT_APP_SNAPSHOT = $json;",
+    ""
+) -join "`n"
+
+Write-Utf8NoBom -Path $outputPath -Content $content
+Write-Host "Seiten-Daten aktualisiert: $outputPath"
+
+# Kostenlos veroeffentlichen
+
+Die einfachste kostenlose Variante fuer dich ist eine statische Veroeffentlichung. Deine Seite braucht keinen Server, keine Datenbank und keine laufenden Dienste.
+
+## Empfehlung
+
+### 1. GitHub Pages
+
+Gut, wenn du es einfach und kostenlos willst.
+
+Kurzablauf:
+
+1. `publish-site.ps1` ausfuehren
+2. Den Inhalt aus `publish/` in ein GitHub-Repository hochladen
+3. In GitHub unter `Settings -> Pages` die Seite aktivieren
+4. Den erzeugten Link auf dem Handy oeffnen
+5. Auf dem Handy zum Startbildschirm hinzufuegen
+
+## Alternative
+
+### 2. Cloudflare Pages
+
+Gut, wenn du lieber einen fertigen Upload statt GitHub Pages willst.
+
+Kurzablauf:
+
+1. `publish-site.ps1` ausfuehren
+2. Bei Cloudflare Pages ein neues Projekt anlegen
+3. `Direct Upload` waehlen
+4. Den Inhalt von `publish/` hochladen
+5. Den erzeugten Link auf dem Handy speichern
+
+## Wichtige Hinweise
+
+- Deine Seite ist statisch. Das ist gut, weil es einfach und guenstig bleibt.
+- Fuer neue Depotdaten musst du den `publish`-Ordner nach jedem Update neu erzeugen und neu hochladen.
+- Solange du keine Serverfunktionen, Logins oder dauernde KI-Aufrufe in die Seite baust, bleibt das Modell sehr wahrscheinlich kostenlos.
+
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101826">
+  <meta name="description" content="Einfache mobile Depot-Seite fuer die bestehende Depot-Automatisierung.">
+  <title>Stefa Depot Startseite</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./assets/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <div class="ambient ambient-a"></div>
+    <div class="ambient ambient-b"></div>
+
+    <header class="hero">
+      <div class="hero-topline">
+        <div>
+          <p class="eyebrow">Mobile Depot-Seite</p>
+          <h1>Stefa Depot Startseite</h1>
+        </div>
+        <span class="badge badge-accent">Auf dem Handy speicherbar</span>
+      </div>
+
+      <div class="hero-grid">
+        <section class="hero-card hero-balance reveal">
+          <p class="card-label">Gesamtwert</p>
+          <h2 id="totalValue">-</h2>
+          <p id="balanceSubline" class="muted">Snapshot wird geladen</p>
+          <div class="health-row">
+            <div class="health-ring" aria-hidden="true">
+              <span id="healthScore">-</span>
+            </div>
+            <div>
+              <p class="card-label">Portfolio-Fitness</p>
+              <p id="healthSummary" class="muted">Regelwerk wird geprueft</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="hero-card reveal">
+          <p class="card-label">Heute wichtig</p>
+          <ul class="signal-list" id="heroSignals"></ul>
+        </section>
+      </div>
+    </header>
+
+    <nav class="tab-bar" aria-label="Bereiche">
+      <button class="tab-button is-active" data-tab="overview">Fokus</button>
+      <button class="tab-button" data-tab="positions">Positionen</button>
+      <button class="tab-button" data-tab="rules">Regeln</button>
+      <button class="tab-button" data-tab="assistant">Wochenbrief</button>
+    </nav>
+
+    <main>
+      <section class="tab-panel is-active" id="tab-overview">
+        <div class="card-grid">
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Kontrolle</p>
+                <h3>Leitplanken</h3>
+              </div>
+              <span class="badge" id="snapshotDateChip">-</span>
+            </div>
+            <div class="stat-grid" id="kpiGrid"></div>
+          </article>
+
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Handlungsdruck</p>
+                <h3>Warnungen und Chancen</h3>
+              </div>
+            </div>
+            <div id="alertsList" class="stack"></div>
+          </article>
+
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Konzentration</p>
+                <h3>Top Cluster</h3>
+              </div>
+            </div>
+            <div id="clusterBars" class="stack"></div>
+          </article>
+
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Naechste Schritte</p>
+                <h3>Wo dir die Seite hilft</h3>
+              </div>
+            </div>
+            <div id="helperModes" class="feature-grid"></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="tab-panel" id="tab-positions">
+        <div class="panel-card panel-card-wide reveal">
+          <div class="section-head section-head-wrap">
+            <div>
+              <p class="eyebrow">Bestand</p>
+              <h3>Positionen im Blick</h3>
+            </div>
+            <div class="controls">
+              <input type="search" id="positionSearch" placeholder="Name, Symbol oder Thema">
+              <div class="filter-row" id="bucketFilters"></div>
+            </div>
+          </div>
+          <div id="positionsList" class="stack"></div>
+        </div>
+      </section>
+
+      <section class="tab-panel" id="tab-rules">
+        <div class="card-grid">
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Deckel</p>
+                <h3>Harte Limits</h3>
+              </div>
+            </div>
+            <div id="hardLimits" class="stack compact-stack"></div>
+          </article>
+
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Zielkorridore</p>
+                <h3>Liquiditaet und Buckets</h3>
+              </div>
+            </div>
+            <div id="corridorList" class="stack compact-stack"></div>
+          </article>
+
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Regellogik</p>
+                <h3>Warum die Seite klarer ist</h3>
+              </div>
+            </div>
+            <div id="logicReasons" class="stack"></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="tab-panel" id="tab-assistant">
+        <div class="card-grid">
+          <article class="panel-card assistant-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Wochenbrief</p>
+                <h3>Kurze Einordnung fuer diese Woche</h3>
+              </div>
+              <span class="badge badge-accent">Optional mit KI ausbaubar</span>
+            </div>
+            <div id="assistantBriefing" class="assistant-copy"></div>
+          </article>
+
+          <article class="panel-card reveal">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Roadmap</p>
+                <h3>Was als Naechstes moeglich ist</h3>
+              </div>
+            </div>
+            <div id="futureStack" class="stack"></div>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="./data/latest-snapshot.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
+
+{
+  "name": "Stefa Depot Startseite",
+  "short_name": "Depot Start",
+  "description": "Einfache mobile Depot-Seite fuer die bestehende Depot-Automatisierung.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#07111d",
+  "theme_color": "#101826",
+  "icons": [
+    {
+      "src": "./assets/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
+
+[CmdletBinding()]
+param(
+    [string]$OutputFolder = ".\publish"
+)
+
+function Resolve-PathSafe {
+    param([string]$PathValue)
+
+    if ([System.IO.Path]::IsPathRooted($PathValue)) {
+        return $PathValue
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot $PathValue))
+}
+
+function Write-Utf8NoBom {
+    param(
+        [string]$Path,
+        [string]$Content
+    )
+
+    $directory = Split-Path -Parent $Path
+    if ($directory) {
+        New-Item -ItemType Directory -Force -Path $directory | Out-Null
+    }
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+}
+
+$outputPath = Resolve-PathSafe $OutputFolder
+
+powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "generate-app-data.ps1")
+
+if (Test-Path $outputPath) {
+    Remove-Item -Recurse -Force $outputPath
+}
+
+New-Item -ItemType Directory -Force -Path $outputPath | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $outputPath "assets") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $outputPath "data") | Out-Null
+
+$filesToCopy = @(
+    "index.html",
+    "styles.css",
+    "app.js",
+    "manifest.webmanifest",
+    "sw.js"
+)
+
+foreach ($file in $filesToCopy) {
+    Copy-Item -Path (Join-Path $PSScriptRoot $file) -Destination (Join-Path $outputPath $file) -Force
+}
+
+Copy-Item -Path (Join-Path $PSScriptRoot "assets\icon.svg") -Destination (Join-Path $outputPath "assets\icon.svg") -Force
+Copy-Item -Path (Join-Path $PSScriptRoot "data\latest-snapshot.js") -Destination (Join-Path $outputPath "data\latest-snapshot.js") -Force
+
+Write-Utf8NoBom -Path (Join-Path $outputPath ".nojekyll") -Content ""
+
+$publishReadme = @"
+Diese Dateien koennen direkt kostenlos veroeffentlicht werden.
+
+Empfohlene Optionen:
+- GitHub Pages: `publish`-Ordner in ein oeffentliches Repository hochladen und Pages aktivieren
+- Cloudflare Pages: `publish`-Ordner per Direct Upload hochladen
+
+Wichtig:
+- Vor jeder neuen Veroeffentlichung erst `generate-app-data.ps1` oder direkt `publish-site.ps1` ausfuehren
+- Danach den aktualisierten `publish`-Ordner neu hochladen
+"@
+
+Write-Utf8NoBom -Path (Join-Path $outputPath "README.txt") -Content $publishReadme
+Write-Host "Fertiger Publish-Ordner erstellt: $outputPath"
+
+# Stefa Depot Startseite
+
+Diese Seite ist als einfache mobile Begleitoberflaeche fuer die bestehende Depot-Automatisierung gedacht.
+
+## Was schon funktioniert
+
+- liest die bestehenden Depotdaten aus `../depot-analyse`
+- zeigt Gesamtwert, Cashquote, Liquiditaet und Risiko-Cluster mobil an
+- markiert harte Regelverstoesse sofort
+- berechnet grobe Entlastungsbetraege fuer uebergrosse Positionen
+- kann direkt im Handy-Browser geoeffnet und auf dem Startbildschirm gespeichert werden
+
+## Dateien
+
+- `generate-app-data.ps1`: uebernimmt die aktuellen Depotdaten in die Seite
+- `publish-site.ps1`: baut einen fertigen Ordner fuer kostenlose Veroeffentlichung
+- `data/latest-snapshot.js`: generierter Datensatz fuer das Frontend
+- `index.html`, `styles.css`, `app.js`: mobile Depot-Seite
+- `manifest.webmanifest`, `sw.js`: PWA-Grundlage
+- `HOSTING.md`: kurze Anleitung fuer kostenlose Veroeffentlichung
+
+## Update-Ablauf
+
+1. Bestehende Depot-Automatisierung wie bisher laufen lassen
+2. Danach `generate-app-data.ps1` ausfuehren
+3. `index.html` direkt oeffnen oder spaeter ueber einen kleinen statischen Host laden
+4. Die Seite am Handy speichern und direkt oeffnen
+
+## Kostenlos online stellen
+
+1. `publish-site.ps1` ausfuehren
+2. Den erzeugten Ordner `publish/` kostenlos veroeffentlichen
+3. Den Link auf dem Handy oeffnen und speichern
+4. Details dazu stehen in `HOSTING.md`
+
+## Am Handy nutzen
+
+- iPhone: Seite in Safari oeffnen und `Zum Home-Bildschirm` waehlen
+- Android: Seite in Chrome oeffnen und `Zum Startbildschirm hinzufuegen` waehlen
+- Danach wirkt die Seite fast wie eine App, bleibt aber technisch einfach und guenstig
+
+## Hinweis zum Start
+
+- Fuer den schnellen lokalen Blick reicht `index.html`.
+- Fuer sauberen Abruf auf mehreren Geraeten ist spaeter ein kleiner statischer Host sinnvoll, zum Beispiel kostenlos.
+
+## Kritische Empfehlung
+
+Die Seite soll die bestehende Logik nicht ersetzen. Der fachliche Wert steckt bereits in eurem Regelwerk und der Analyse-Pipeline. Der groesste Hebel liegt jetzt in mobiler Darstellung, Klarheit und moeglichst wenig Reibung auf dem Handy.
+
+[CmdletBinding()]
+param(
+    [int]$Port = 4173
+)
+
+$root = $PSScriptRoot
+
+function Get-ContentType {
+    param([string]$Path)
+
+    switch ([System.IO.Path]::GetExtension($Path).ToLowerInvariant()) {
+        ".html" { "text/html; charset=utf-8" }
+        ".css" { "text/css; charset=utf-8" }
+        ".js" { "application/javascript; charset=utf-8" }
+        ".json" { "application/json; charset=utf-8" }
+        ".svg" { "image/svg+xml" }
+        ".webmanifest" { "application/manifest+json; charset=utf-8" }
+        default { "application/octet-stream" }
+    }
+}
+
+function Write-Response {
+    param(
+        [System.Net.Sockets.NetworkStream]$Stream,
+        [int]$StatusCode,
+        [string]$StatusText,
+        [byte[]]$Body,
+        [string]$ContentType = "text/plain; charset=utf-8"
+    )
+
+    $headers = @(
+        "HTTP/1.1 $StatusCode $StatusText",
+        "Content-Type: $ContentType",
+        "Content-Length: $($Body.Length)",
+        "Connection: close",
+        "",
+        ""
+    ) -join "`r`n"
+
+    $headerBytes = [System.Text.Encoding]::ASCII.GetBytes($headers)
+    $Stream.Write($headerBytes, 0, $headerBytes.Length)
+    $Stream.Write($Body, 0, $Body.Length)
+}
+
+try {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+    $listener.Start()
+}
+catch {
+    Write-Error "Preview-Server konnte nicht gestartet werden: $($_.Exception.Message)"
+    exit 1
+}
+
+Write-Host "Stefa Depot Startseite laeuft auf http://localhost:$Port/"
+Write-Host "Beenden mit Strg+C"
+
+while ($true) {
+    $client = $listener.AcceptTcpClient()
+
+    try {
+        $stream = $client.GetStream()
+        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::ASCII, $false, 1024, $true)
+        $requestLine = $reader.ReadLine()
+
+        while ($reader.Peek() -ge 0) {
+            $line = $reader.ReadLine()
+            if ([string]::IsNullOrEmpty($line)) {
+                break
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($requestLine)) {
+            $body = [System.Text.Encoding]::UTF8.GetBytes("Leere Anfrage")
+            Write-Response -Stream $stream -StatusCode 400 -StatusText "Bad Request" -Body $body
+            continue
+        }
+
+        $parts = $requestLine.Split(" ")
+        $rawPath = if ($parts.Length -ge 2) { $parts[1] } else { "/" }
+        $requestPath = $rawPath.Split("?")[0].TrimStart("/")
+        if ([string]::IsNullOrWhiteSpace($requestPath)) {
+            $requestPath = "index.html"
+        }
+
+        $safePath = $requestPath.Replace("/", "\")
+        $filePath = [System.IO.Path]::GetFullPath((Join-Path $root $safePath))
+
+        if (-not $filePath.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path $filePath -PathType Leaf)) {
+            $body = [System.Text.Encoding]::UTF8.GetBytes("Nicht gefunden")
+            Write-Response -Stream $stream -StatusCode 404 -StatusText "Not Found" -Body $body
+            continue
+        }
+
+        $bytes = [System.IO.File]::ReadAllBytes($filePath)
+        $contentType = Get-ContentType $filePath
+        Write-Response -Stream $stream -StatusCode 200 -StatusText "OK" -Body $bytes -ContentType $contentType
+    }
+    finally {
+        if ($stream) {
+            $stream.Dispose()
+        }
+        $client.Dispose()
+    }
+}
+
+:root {
+  --bg: #07111d;
+  --bg-soft: rgba(17, 28, 46, 0.78);
+  --panel: rgba(12, 24, 40, 0.78);
+  --panel-strong: rgba(9, 19, 33, 0.92);
+  --line: rgba(255, 255, 255, 0.08);
+  --text: #eef4fb;
+  --muted: #98acc5;
+  --accent: #7ef0cf;
+  --accent-strong: #35caa4;
+  --warn: #ffb25e;
+  --danger: #ff7b6f;
+  --shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
+  --radius: 28px;
+  --radius-sm: 18px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  font-family: "Space Grotesk", "Aptos", "Segoe UI Variable", sans-serif;
+  background:
+    radial-gradient(circle at top left, rgba(126, 240, 207, 0.14), transparent 30%),
+    radial-gradient(circle at top right, rgba(255, 178, 94, 0.12), transparent 24%),
+    linear-gradient(180deg, #0c1624 0%, #08111c 45%, #07101a 100%);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.app-shell {
+  width: min(100%, 1100px);
+  margin: 0 auto;
+  padding: 24px 18px 88px;
+  position: relative;
+}
+
+.ambient {
+  position: fixed;
+  inset: auto;
+  width: 240px;
+  height: 240px;
+  border-radius: 999px;
+  filter: blur(48px);
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+.ambient-a {
+  top: 8%;
+  right: -80px;
+  background: rgba(126, 240, 207, 0.18);
+}
+
+.ambient-b {
+  bottom: 12%;
+  left: -60px;
+  background: rgba(255, 178, 94, 0.15);
+}
+
+.hero,
+.tab-bar,
+.panel-card {
+  position: relative;
+  z-index: 1;
+}
+
+.hero {
+  display: grid;
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
+.hero-topline {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.eyebrow {
+  margin: 0 0 6px;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  font-size: 0.72rem;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: clamp(2rem, 6vw, 3.5rem);
+  line-height: 0.94;
+  max-width: 12ch;
+}
+
+h2 {
+  font-size: clamp(2.2rem, 7vw, 4rem);
+  line-height: 1;
+  letter-spacing: -0.04em;
+}
+
+h3 {
+  font-size: 1.2rem;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.ghost-button,
+.tab-button,
+.chip-button {
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 0.72rem 1rem;
+  cursor: pointer;
+  transition: transform 180ms ease, background 180ms ease, border-color 180ms ease;
+}
+
+.ghost-button:hover,
+.tab-button:hover,
+.chip-button:hover,
+.chip-button.is-active {
+  transform: translateY(-1px);
+  background: rgba(126, 240, 207, 0.12);
+  border-color: rgba(126, 240, 207, 0.35);
+}
+
+.hero-grid,
+.card-grid {
+  display: grid;
+  gap: 16px;
+}
+
+.hero-grid {
+  grid-template-columns: 1.25fr 1fr;
+}
+
+.panel-card,
+.hero-card {
+  background: linear-gradient(180deg, rgba(17, 32, 52, 0.88), rgba(9, 19, 33, 0.88));
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(18px);
+}
+
+.hero-card,
+.panel-card {
+  padding: 22px;
+}
+
+.panel-card-wide {
+  min-height: 60vh;
+}
+
+.card-label {
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin-bottom: 8px;
+}
+
+.health-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 22px;
+}
+
+.health-ring {
+  width: 92px;
+  height: 92px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  background:
+    radial-gradient(circle at center, rgba(7, 17, 29, 0.95) 52%, transparent 53%),
+    conic-gradient(var(--accent) 0deg, rgba(255, 255, 255, 0.14) 0deg);
+  border: 1px solid rgba(126, 240, 207, 0.22);
+  color: var(--text);
+  font-size: 1.3rem;
+  font-weight: 700;
+}
+
+.signal-list,
+.stack {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.signal-item,
+.alert-card,
+.mini-card,
+.reason-card,
+.future-card,
+.position-card {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 20px;
+}
+
+.signal-item,
+.alert-card,
+.mini-card,
+.reason-card,
+.future-card {
+  padding: 14px 16px;
+}
+
+.signal-item strong,
+.alert-card strong,
+.position-card strong,
+.future-card strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.tab-bar {
+  position: sticky;
+  top: 12px;
+  display: flex;
+  gap: 10px;
+  padding: 10px;
+  margin-bottom: 18px;
+  background: rgba(10, 18, 31, 0.74);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.tab-button {
+  flex: 1;
+}
+
+.tab-button.is-active {
+  background: linear-gradient(135deg, rgba(126, 240, 207, 0.24), rgba(126, 240, 207, 0.08));
+  border-color: rgba(126, 240, 207, 0.36);
+}
+
+.tab-panel {
+  display: none;
+}
+
+.tab-panel.is-active {
+  display: block;
+}
+
+.card-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.section-head-wrap {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0.45rem 0.72rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--muted);
+  font-size: 0.86rem;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.badge-accent {
+  background: rgba(126, 240, 207, 0.12);
+  color: var(--accent);
+  border-color: rgba(126, 240, 207, 0.2);
+}
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.mini-card .value {
+  font-size: 1.4rem;
+  line-height: 1.05;
+  margin-bottom: 4px;
+}
+
+.tone-good {
+  color: var(--accent);
+}
+
+.tone-warn {
+  color: var(--warn);
+}
+
+.tone-danger {
+  color: var(--danger);
+}
+
+.alert-card {
+  display: grid;
+  gap: 8px;
+}
+
+.alert-topline,
+.position-head,
+.bar-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.34rem 0.7rem;
+  font-size: 0.78rem;
+  border: 1px solid transparent;
+}
+
+.pill-good {
+  color: var(--accent);
+  background: rgba(126, 240, 207, 0.1);
+  border-color: rgba(126, 240, 207, 0.18);
+}
+
+.pill-warn {
+  color: var(--warn);
+  background: rgba(255, 178, 94, 0.12);
+  border-color: rgba(255, 178, 94, 0.18);
+}
+
+.pill-danger {
+  color: var(--danger);
+  background: rgba(255, 123, 111, 0.12);
+  border-color: rgba(255, 123, 111, 0.18);
+}
+
+.bar {
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.bar > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #7ef0cf, #49d8f5);
+}
+
+.bar.warn > span {
+  background: linear-gradient(90deg, #ffcf73, #ff9a6a);
+}
+
+.bar.danger > span {
+  background: linear-gradient(90deg, #ff8e7f, #ff6370);
+}
+
+.feature-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.feature-card {
+  padding: 14px 16px;
+  border-radius: 20px;
+  background: linear-gradient(180deg, rgba(126, 240, 207, 0.1), rgba(255, 255, 255, 0.03));
+  border: 1px solid rgba(126, 240, 207, 0.12);
+}
+
+.controls {
+  display: grid;
+  gap: 10px;
+  width: min(100%, 420px);
+}
+
+input[type="search"] {
+  width: 100%;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  padding: 0.9rem 1rem;
+}
+
+input[type="search"]::placeholder {
+  color: rgba(152, 172, 197, 0.78);
+}
+
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.position-card {
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.position-meta,
+.position-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.meta-chip {
+  padding: 0.34rem 0.65rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.assistant-card {
+  min-height: 420px;
+}
+
+.assistant-copy {
+  display: grid;
+  gap: 14px;
+}
+
+.assistant-block {
+  padding: 16px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.assistant-block ul {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.compact-stack {
+  gap: 10px;
+}
+
+.compact-stack .mini-card {
+  padding: 12px 14px;
+}
+
+.reveal {
+  opacity: 0;
+  transform: translateY(16px);
+  animation: revealUp 620ms ease forwards;
+}
+
+.reveal:nth-child(2) {
+  animation-delay: 100ms;
+}
+
+.reveal:nth-child(3) {
+  animation-delay: 160ms;
+}
+
+.reveal:nth-child(4) {
+  animation-delay: 220ms;
+}
+
+@keyframes revealUp {
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 880px) {
+  .hero-grid,
+  .card-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .tab-bar {
+    bottom: 12px;
+    top: auto;
+    position: fixed;
+    left: 12px;
+    right: 12px;
+  }
+
+  .app-shell {
+    padding-bottom: 116px;
+  }
+}
+
+@media (max-width: 560px) {
+  .app-shell {
+    padding: 18px 14px 110px;
+  }
+
+  .hero-card,
+  .panel-card {
+    padding: 18px;
+    border-radius: 24px;
+  }
+
+  .stat-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .health-row,
+  .hero-topline,
+  .alert-topline,
+  .position-head,
+  .section-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .tab-bar {
+    gap: 8px;
+    padding: 8px;
+  }
+
+  .tab-button {
+    padding-inline: 0.72rem;
+  }
+}
+
+const CACHE_NAME = "depot-cockpit-v1";
+const ASSETS = [
+  "./",
+  "./index.html",
+  "./styles.css",
+  "./app.js",
+  "./manifest.webmanifest",
+  "./assets/icon.svg",
+  "./data/latest-snapshot.js",
+];
+
+self.addEventListener("install", (event) => {
+  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS)));
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(
+        keys
+          .filter((key) => key !== CACHE_NAME)
+          .map((key) => caches.delete(key))
+      )
+    )
+  );
+});
+
+self.addEventListener("fetch", (event) => {
+  event.respondWith(
+    caches.match(event.request).then((cached) => cached || fetch(event.request))
+  );
+});
